@@ -1,11 +1,95 @@
-#summary TODO: Put in page summary
-#labels TODO
+#labels introduction,parallel,Featured,dependencyanalysis,multicore,compiler
+= Tisk =
+The general consensus of the hardware chip manufacturers is that computer chips will no longer be able to sustain the speed developments they have historically seen. Instead, computer chips are going in a different direction and embedding multiple processing units on the same physical chip. This "multi-core" evolution has raised many issues with software development because of the inherent problems with parallel programming.
 
-= Introduction =
+The classic ideal is that a programmer would write their application with specific knowledge of the underlying architecture and be able to hand code parallel adjustments and distribute tasks and threads around multi-core machines, but this ideal does not encompass the "many-core" paradigm. The process of hand optimizing code and algorithms to a specific platform does not scale to the potential of hundreds, possibly thousands of processing units. A new process needs to be identified to address the core issue of parallelism in a scalable environment.
 
-TODO: Describe Tisk
+Automatic parallelization has been the holy grail of compiler design. The main problem with developing a compiler that is intelligent enough to determine if a function can be distributed it must know enough about the architecture, the program flow, and the memory access in order to safely and efficiently distribute tasks over multiple processors. There are two major factors that are involved with developing a automatic parallelization compiler.
 
+ # Must determine the dependencies to determine if it is safe to distribute the algorithm
+ # Must be able to determine if it is efficient to distribute the algorithm
 
-= Details =
+This requires deep program analysis that is not currently allowed with the popular C/C++. Instead of retrofitting an existing high level language to adapt to the parallel problems, the idea of creating a lower level instruction set dedicated to deep program analysis allows for the previously mentioned cases to be analyzed and automatic distribution can, in fact, become a reality.
 
-TODO: Put the implementation details here!
+Tisk is not an explicit parallel language, meaning that is does not guarantee that certain sections are going to run in parallel. It will look at it's domain and the environment it is running on and try to make the best guess for the best performance. When the final conversion from the intermediate language to the machine language occurs it utilizes available performance statistics and attributing data tied into the intermediate language to make the decision to distribute or to use other features local to that architecture.
+
+== Dependency Analysis ==
+
+A large majority of programs spend most of their time nested in loops, and because of this it is possible to analyze a program and determine when and where to parallel. Take the following example(Note: Tisk is an Intermediate Language and does not have a C/C++ compiler as of writing this, however for simplicity I am going to express structure and flow using the C/C++ language):
+
+{{{
+void SimpleIteration( int num )
+{
+    for(int i = 0; i < 10; i++)
+    {
+        Vector3 a(0, num, 0);
+        Vector3 b(0, 0, num);
+        Vector3 c(0, 0, 0);
+
+        Vector3Add(&c, &a, &b);
+        Vector3SomeFunc(&c);
+    }
+}
+}}}
+
+All the function does is add two vectors together and output the result into variable c and then runs some function on that vector. We can look at the code generated and determine that the times the loop is called is a fixed amount so we can unroll the loop which greatly increases the size of the function but could speed up the processing because there is no branching(Note: unrolling should only extend to a maximum of half the size of your code cache to avoid getting from main memory too often). Because there is no branching it is known as a linear execution block. This function, because it doesn't have any other dependencies, can be executed in parallel. Now let's look at some code that uses this:
+
+{{{
+void DependentIteration1(int num)
+{
+    for(int i = 0; i < num; i++)
+    {
+        SimpleIteration(i);
+    }
+}
+}}}
+
+This function is a little more complicated because in order to know how many times to unroll the loop, the parameter to the loop needs to be a constant. In order to determine this we need to know every single call to this function and look at the data being passed to the function. While this is possible(and something built into the compiler), for this example we are going to say that the parameter is a variable amount and so this loop can not be vectorized.
+
+Because the loop doesn't depend on anything other then incrementing the iterator, then each call to SimpleIteration() can be distributed. We know this because SimpleIteration() was already unrolled and therefor is a linear execution block and each call to SimpleIteration() doesn't have any cross dependencies. There is a caveat to this though because SimpleIteration() is now getting called from parallel threads the output of Vector3SomeFunc() is not in order. For the purposes of this example, that is acceptable. To change that, you can put a specifier on the function that demands that all instances of the function run in either asychronous or synchronous ways by specifying the maximum number of times a function can be run to 1. This forces the function to be run in the order in which it is called.
+
+Another form of dependent iteration is if the next execution block relies on the contents of the previous block. For example
+
+{{{
+void DependentIteration2(int num)
+{
+    int i = num;
+    while(i!=0)
+    {
+        SimpleIteration(i);
+        i--;
+    }
+}
+}}}
+
+With this style of loop, each iteration relies on the previous iteration. In the best case scenario, such as the example above, the compiler will be able to determine the number of times to unroll the loop, however, with this case we are going to assume the value getting passed in is variable. There are two options we have with this style of loop. The first way is to let the loop run and call the function in the same thread without distribution. Another way is to distribute by separating the contents of the while loop and create an array to output the variable i and then, using the output array, distribute the SimpleIteration() calls accordingly. This may or may not be optimal and that is something that is determined by a number of factors such as usage statistics and memory locality of data and the resource definition used. Allocating and de-allocating are relatively expensive operations and so that is taken into consideration.
+
+Even more complicated is the handling of recursive functions.
+
+{{{
+int Factorial(int num)
+{
+    if(num==0) { return 1; }
+    else { return num * Factorial(num-1); }
+}
+}}}
+
+In this example we can see Factorial calls itself. There are a couple things we can do here upon program analysis. For this case, the same algorithm can be expressed as a loop:
+
+{{{
+int FactorialLoop(int num)
+{
+    int running_total = 1;
+    while(num!=0)
+    {
+        running_total = running_total * (num);
+        num--;
+    }
+}
+}}}
+
+Note: I have not yet come across a case of recursion that can not be implemented as a loop. Even trees can be implemented with a stack.
+
+In cases where there is recursion, and the recursion can not be expressed as a loop for performance or other reasons(indirect recursion comes to mind), the compiler would create a separate stack and process the function seperately, but it would do so by putting a limit on the maximum number of instances of the factorial function could be processed. Once that limit has been reached, it will pause the execution and continue with other tasks in a similar way as the endless looping condition.
+
+Because we know more information about the program structure and flow in Tisk, it is possible now to determine if a function can be safely distributed, and with flags on each function a programmer can specify if they want to override the distribution and disable it in certain cases. The next problem is determining the most efficient way of distributing algorithms. As we saw with the DependentIteration2() function, it is technically possible to distribute some algorithms, but not always the most optimal.
